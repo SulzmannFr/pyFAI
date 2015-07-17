@@ -30,29 +30,64 @@ __date__ = "28/05/2015"
 __status__ = "development"
 __docformat__ = 'restructuredtext'
 
+
+import pyFAI
+import numpy 
+import scipy
+import fabio
+
+
+from pyFAI.blob_detection import BlobDetection
+from pyFAI import detectors
+from pyFAI.bilinear import Bilinear
+from matplotlib import pyplot
+import matplotlib.cm as cm
+import matplotlib.mlab as mlab
+import matplotlib.pyplot as plt
+
+from scipy import ndimage
+from scipy import asarray as ar,exp
+from scipy.optimize import curve_fit, fmin
+from scipy.ndimage import morphology
+
+from sklearn import cluster, datasets
+from sklearn import metrics
+from sklearn.neighbors import kneighbors_graph
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import KMeans
+from sklearn.datasets import load_digits
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import scale
+
+
 import logging
 import numpy
 import os
 import time
 
-from . import detectors
-from . import units
-from .third_party import six
-StringTypes = (six.binary_type, six.text_type)
+import numpy.ma as m
 
-logger = logging.getLogger("pyFAI.grid")
+#from . import detectors
+#from . import units
+#from .third_party import six
+#StringTypes = (six.binary_type, six.text_type)
+
+#logger = logging.getLogger("pyFAI.grid")
 
 class Grid(object):
     """
     This class handles a regular grid in front of a detector to calibrate the 
     geometrical distortion of the detector 
     """
-    def __init__(self, detector, image, mask=None, pitch=None, invert=False):
+    def __init__(self, detector, image, pitch, beamcenter, detectordistance, mask=None, invert=False): 
         """
         @param detector: instance of Detector or its name
-        @parma image: 2d array representing the image  
+        @param image: 2d array representing the image  
         @param mask:
-        @param pitch: 2-tuple representing the grid spacing in (y, x) coordinates, in meter
+        @param pitch: floating number in millimeter, representing distance between holes
+        @param beamcenter: 2d array for the position of the beam, (y,x)-coordinate in Px
+        @param detectordistance: floating number in meter representing distance between detector and scatterin object
         @param invert: set to true if the image of the grid has regular dark spots (instead of bright points) 
         """
         if isinstance(detector, detectors.Detector):
@@ -76,155 +111,326 @@ class Grid(object):
             self.mask = numpy.zeros_like(self.image, bool)
         if invert:
             self.image = self.image.max() - self.image
-        self.pitch = tuple(pitch[0], pitch[-1])
-        self.coordinates=[]
-        self.distances=[]
-        self.indices=[]
-        self.mean_distance=[]
-        self.mean_distance_min=[]
-        self.mean_distance_max=[]
-        self.good_peaks=[]
-        self.mean_vec_y = []
-        self.mean_vec_x = []
-        self.center_of_grid = []
-        self.grid = {}
         
+        
+        self.pitch = pitch
+        self.detectordistance = detectordistance
+        self.beamcenter = beamcenter
+        self.coordinates=[]
+        self.good_peaks=[]
+        self.mean_vec = []
+        self.module_translation = []
+        self.grid_angle =[]
+        self.grid =[]
+        
+   
             
-    def aply_threshold(self, level=None, percentile=None):
+    def apply_threshold(self, level=None, percentile=None, module=None):
         """
         Segment the image with a single threshold
-        @param 
-        @param 
+        @param  level integernumber for the intensity, should be high 
+                enough to get rid of the diffused points
+        @param  percentile number between 0 and 100, can be easily 
+                calculated with the proportion between hole and pitch.
         """
         if percentile and not level:
             data = self.image[self.mask].flatten()
             data.sort()
             level = data[int(len(data) * percentile / 100.)]
+        if module is not None:    
+            m = Singlemodule(self.detector,module).mask_module()
+            for i in range(numpy.shape(self.image)[1]):
+                for j in range(numpy.shape(self.image)[0]):
+                    if m[j,i] == 1:
+                        self.image[j,i] = 0
         thres = level
-        mask = img>thres
+        mask = self.image>thres
         lbl,n = scipy.ndimage.label(mask)
-        b = numpy.array(scipy.ndimage.measurements.center_of_mass(img, lbl, range(n)))
-        v=np.std(Image)
+        b = numpy.array(scipy.ndimage.measurements.center_of_mass(self.image, lbl, range(n)))
         self.coordinates = numpy.array(b)
 
-    def nearest_neighbors(self):
+    def define_nearest_neighbors(self):
         """
         Defines the nearest neighbors and exculde not suitible,
         under condition of historamm
         """
-        nbrs = NearestNeighbors(n_neighbors = 5, algorithm='ball_tree').fit(self.coordinates)
-        self.distances, self.indices = nbrs.kneighbors(self.coordinates)
-        hist, bin_edges = np.histogram(self.distances[:,1:5], bins=1000)
+        if self.coordinates == []:
+            self.apply_threshold()
+        distances, indices = Grid.get_nearest_neighbors(self.coordinates,5)
+        hist, bin_edges = numpy.histogram(distances[:,0:4], bins=1000)
         bin_centres = (bin_edges[:-1] + bin_edges[1:])/2
         def gauss(x, *p):
             A, mu, sigma = p
-            return A*np.exp(-(x-mu)**2/(2.*sigma**2));
-        c=np.zeros(2*len(self.coordinates)).reshape(len(self.coordinates),2)
+            return A*numpy.exp(-(x-mu)**2/(2.*sigma**2));
+        c=self.coordinates
         p0 = [hist[1:].max(), bin_centres[hist[1:].argmax()+1], 1.]
         coeff, var_matrix = curve_fit(gauss, bin_centres, hist, p0=p0)
-        test = 4
-        self.mean_distance = coeff[1]
-        self.mean_distance_min = coeff[1]-abs(test*coeff[2])
-        self.mean_distance_max = coeff[1]+min(test*abs(coeff[2]),coeff[1]/np.sqrt(2))
-        for i in range(len(self.coordinates)):
-            for l in range(0,5):
-                if self.distance_min <= self.distance[i,l] <= self.distances_max:
-                    c[i]=c1[i]
-        self.good_peaks = c[c.all(1)]
-   
-    def mean_of_vectors(self):
-        """
-        Gives the averaged vector of the grid in x and y axis. 
-        They are called mean_vec_x, mean_vec_y, respectively
-        """ 
-        maax = self.mean_distance_max
-        miin = self.mean_distance_min
-        all_vectors = np.zeros(8*len(self.coordinates)).reshape(4*len(self.coordinates),2)
-        for l in range(1,5):
-            for j in range(len(self.coordinates)):
-                all_vectors[(l-1)*len(self.coordinates)+j,:] = self.coordinates[j,:]-self.coordinates[self.indices[j,l],:]
-        for k in range(len(all_vectors)):
-            if abs(all_vectors[k,1]) > maax or 3 < abs(all_vectors[k,1]) < miin:
-                all_vectors[k,:] = 0 
-            elif abs(all_vectors[k,0]) > maax or 3 < abs(all_vectors[k,0]) < miin:
-                all_vectors[k,:] = 0 
-        all_vectors = all_vectors[all_vectors.all(1)]
-        ms = KMeans(n_clusters=8).fit(all_vectors)
-        Mean =  ms.cluster_centers_
-        self.mean_vec_y = np.array([0,0])
-        self.mean_vec_x = np.array([0,0])
-        for i in range(0,8):
-            for j in range(1,8):
-                if abs(Mean[i,0])-abs(Mean[j,0])<1 and miin <abs(Mean[i,0])< maax and miin <abs(Mean[j,0])< maax and abs(Mean[i,1])<1 and abs(Mean[j,1])<1:
-                    self.mean_vec_y= np.add(abs(Mean[i]),abs(Mean[j]))/2
-                if abs(Mean[i,1])-abs(Mean[j,1])<1 and miin < abs(Mean[i,1])< maax and miin < abs(Mean[j,1])< maax and abs(Mean[i,0])<1 and abs(Mean[j,0])<1:
-                    self.mean_vec_x= np.add(abs(Mean[i]),abs(Mean[j]))/2
-    #Achtung nur absolut Werte!!!!!
-
-    def define_center_of_grid(self):
-        """
-        Finds the coordinate of the peak, which is closest to the center
-        of the Module
-        """
-        f = numpy.append(self.good_peaks, self.Singlemodule.center_of_modules,axis=0)
-        number = self.Singlemodule.amount 
-        nbrs = NearestNeighbors(n_neighbors = 2, algorithm='ball_tree').fit(f)
-        distances, indices = nbrs.kneighbors(f)
-        Center = numpy.zeros(2*number).reshape(number,2)
-        for i in range(number):
-            Center[i] = self.good_peaks[indices[len(indices)-(number+1)+i,1]]
-        self.center_of_grid = Center
-        #Achtung Center of modules von nicht genutzten Modulen muessen noch eliminiert werden
+        mean_distance = coeff[1]
+        mean_distance_min = coeff[1]-abs(4*coeff[2])
+        mean_distance_max = coeff[1]+4*abs(coeff[2])
+        mask2 = numpy.where(numpy.logical_and(distances>=mean_distance_min, distances<=mean_distance_max).sum(axis=-1)==4)[0]
+        self.good_peaks = c[mask2,:]
     
-    def spacing_grid(self):
+    def get_angle(self,x=None):
         """
-        Constructs the dictonary where one will save the the points for 
-        the grid. There are as many 'keys' as modules. For example they 
-        are named Module_1 and it's 'values' will be a numpy array with 
-        the (y,x) coordinates of the points of the grid
         """
-        for i in range(self.Singlemodule.amount):
-            self.grid['Module_%d' %i] = 0
+        if x is None:
+             x = self.good_peaks
+        distances, indices = Grid.get_nearest_neighbors(x,4)
+        a = len(x)
+        mean = distances[:,0].mean()
+        coordinates = numpy.zeros((a,4,2))
+        numbers = numpy.zeros((a,3,2))
+        phiy, phix = numpy.zeros(a),numpy.zeros(a)
+        coorx, coory = numpy.zeros((a,2)),numpy.zeros((a,2))
+        for i in range(a):
+            for j in range(3):
+                coordinates[i,j+1,:] = x[i,:] - x[indices[i,j],:]
+                numbers[i,j,:] =  numpy.around(coordinates[i,j+1]/mean)
+                if numbers[i,j,0] == 1 and numbers[i,j,1] == abs(0):
+                    phiy[i] = numpy.rad2deg(numpy.arctan(coordinates[i,j+1,1]/coordinates[i,j+1,0]))
+                    coory[i,:] = coordinates[i,j+1,:]
+                if numbers[i,j,1] == 1 and numbers[i,j,0] == abs(0):
+                    phix[i] = numpy.rad2deg(numpy.arctan(coordinates[i,j+1,0]/coordinates[i,j+1,1]))
+                    coorx[i,:] = coordinates[i,j+1,:]
+        coorx = coorx[coorx != 0]
+        coory = coory[coory != 0]
+        phix = phix[phix != 0]
+        phiy = phiy[phiy != 0]
+        coorx = coorx.reshape(len(phix),2)
+        coory = coory.reshape(len(phiy),2)
+        vec = numpy.array([coory.mean(axis=0),coorx.mean(axis=0)])
+        phi = numpy.sign(phix.mean())*(abs(phix.mean())+abs(phiy.mean()))/2
+        self.mean_vec = vec
+        return phi, vec;
+        
+
+    
+    def minimize(self):
+        """
+        taranslation,angle,gap has to be optimised
+        x,detectordistance,beamcenter,pitch constant
+        gap & detectordistance in m
+        """
+        if self.good_peaks == []:
+            self.define_nearest_neighbors()
+        if self.mean_vec == []:
+            self.get_angle()
+        x = self.good_peaks
+        beamcenter= self.beamcenter
+        pitch = self.pitch
+        detectordistance = self.detectordistance
+        # Initial Guesses:
+        beamcentery,beamcenterx = self.beamcenter
+        gap = Grid.get_grid_detector_gap(x,detectordistance,pitch)
+        c = numpy.array([gap, pitch,detectordistance,beamcentery,beamcenterx])
+        c = tuple(numpy.append(x.flatten(),c))
+        transy, transx = Grid.find_center_of_mass(self.good_peaks)
+        phi, vector = self.get_angle(x) 
+        p0 = numpy.array([transx,transy,phi])
+        print p0
+        def grid(v,*c):
+            """
+            """
+            transx,transy,phi = v
+            coord,gap,pitch,detectordistance = c[:-5],c[-5],c[-4],c[-3]
+            beamcentery, beamcenterx = c[-2],c[-1]
+            beamcenter =  numpy.array([beamcentery, beamcenterx])
+            x = numpy.asarray(coord).reshape(len(coord)/2,2)
+            gap = Grid.get_grid_detector_gap(x,detectordistance,pitch)
+            x,transx,transy,bc = Grid.correct_points(x, detectordistance,
+                                            beamcenter,pitch, gap=gap,
+                                            shiftx=transx, shifty=transy)
+            phi, control_vec = self.get_angle(x)
+            ind_control = Grid.get_indices(x,transx,transy,control_vec)
+            vec = Grid.get_pitch_vector(pitch,phi)
+            ind_grid = Grid.get_indices(x,transx,transy,vec)
+            delta = ind_control-ind_grid
+            err = (delta[0,:]**2 + delta[1,:]**2).sum()
+            return err;
+        opt = fmin(grid,p0,c)
+        print opt
+        good_peak, bc = Grid.correct_points(opt[0:2], detectordistance, beamcenter, pitch, gap=gap)
+        top = Grid.get_detectorplane_position(opt[0:2],bc,detectordistance,pitch,gap=gap)
+        print top
+        top = top[0]+top[1]
+        vector =   Grid.get_pitch_vector_at_detector(pitch,opt[2],0.647, gap)
+        print vector 
+        u = Grid.get_indices(self.good_peaks,top[1],top[0],vector)
+        print u.min(),u.max()
+        print top
+        self.grid = numpy.dot(u,vector)+top
+        self.module_translation = (self.grid-x).mean(axis=0)
+        self.grid_angle = opt[2]
+        return self.module_translation,self.grid_angle;
+        
+
+        
+
+    
+    @staticmethod
+    def get_nearest_neighbors(x,neighbors):
+        """
+        """
+        nbrs = NearestNeighbors(n_neighbors = neighbors, algorithm='ball_tree').fit(x)
+        dis, ind = nbrs.kneighbors(x)
+        distances = dis[:,1:neighbors]
+        indices = ind[:,1:neighbors]
+        return distances, indices;
+        
+    @staticmethod
+    def get_grid_detector_gap(x,detectordistance,pitch):
+        """
+        Calculates the grid detector distance, due to the theorem of Thales
+        @param x: 2d array of (y,x) coordinates
+        @param detectordistance: Distance between detector and sample in m
+        @param pitch: Assuming a quadratic gird, pinnholedistance in mm
+        @return: grid detector distance in m
+        """
+        
+        distances, indices = Grid.get_nearest_neighbors(x,5)
+        mean = distances[:,0].mean()
+        distances_ab = numpy.zeros(distances.shape)
+        numbers = numpy.zeros((len(x),4,2))
+        norm = pitch*10**(3)/172.
+        for i in range(len(x)):
+            for j in range(4):
+                numbers[i,j,:] = numpy.around((x[i]-x[indices[i,j]])/mean)
+                distances_ab[i,j] = numpy.sqrt((numbers[i,j,0]*norm)**2+(numbers[i,j,1]*norm)**2)
+        verhaltnis = (distances_ab/distances).mean()
+        gap = detectordistance-(detectordistance*verhaltnis)
+        return gap;
+        
+    @staticmethod
+    def get_pitch_vector(pitch,angle):
+        """
+        pitch in mm
+        """
+        phi = numpy.deg2rad(angle)
+        norm = pitch*10**(3)/172.
+        vector = numpy.array([[norm*numpy.cos(phi),abs(norm*numpy.sin(phi))],
+                            [-norm*numpy.sin(phi),norm*numpy.cos(phi)]])
+        return vector;
+    
+    @staticmethod
+    def get_pitch_vector_at_detector(pitch,angle,detectordistance,gap):
+        """
+        pitch in mm
+        """
+        phi = numpy.deg2rad(angle)
+        norm = pitch*10**(3)/172.*(gap/detectordistance+1)
+        vector = numpy.array([[norm*numpy.cos(phi),norm*numpy.sin(phi)],
+                            [-norm*numpy.sin(phi),norm*numpy.cos(phi)]])
+        return vector;
+
+    @staticmethod
+    def get_detectorplane_position(x,beamcenter,detectordistance,pitch,gap=None):
+        """
+        """
+        if gap is None:
+            gap = Grid.get_grid_detector_gap(x,detectordistance,pitch)
+        peaks = x-beamcenter
+        peaks = numpy.append([peaks],[beamcenter],axis=0)
+        z = numpy.ones((len(peaks),2))
+        z[:,0] = -((detectordistance-gap)/172e-6)
+        peaks = numpy.append(peaks,z,axis=1)
+        d = detectordistance/172e-6
+        Projektion = numpy.identity(4)
+        Projektion[3,2] = -1/d
+        Projektion[3,3] = 0
+        c = numpy.dot(Projektion,peaks.T[:]).T
+        c = c[:]/c[0,3]
+        good_peaks = c[:,0:2]
+        return good_peaks;
+        
+    @staticmethod
+    def find_center_of_mass(x):
+        """
+        Returns that point of the given one, which is closest to the 
+        center of mass.
+        @param x: 2d array of (y,x) coordinates
+        @return: 1d array with (y,x) coordinates
+        
+        """
+        p = cluster.KMeans(n_clusters=1).fit(x).cluster_centers_
+        f = numpy.append(x, p,axis=0)
+        distances, indices = Grid.get_nearest_neighbors(f,2)
+        x0 = x[indices[-1,0]]
+        return x0;
+        
+        
+
+    @staticmethod
+    def get_indices(x,xcoordinate,ycoordinate,vector):
+        """
+        @param x: 2d array of (y,x) coordinates
+        @param xcoordinate: shift of the starting point in x-direction
+        @param ycoordinate: shift of the starting point in y-direction
+        @param vecor: 2x2 matrix with the supporting vectors of the grid
+        @return: 2d array with floating points, with gives the position 
+                of the points accortind to the supporting vector and 
+                starting point
+        """
+        x0 = numpy.array([ycoordinate,xcoordinate])
+        invT = numpy.linalg.inv(vector)
+        u = numpy.dot(invT,(x-x0).T).T
+        return u;
+    
+    @staticmethod
+    def correct_points(x, detectordistance, beamcenter, pitch, gap=None , shiftx=None,shifty=None):
+        """
+        """
+        if gap is None:
+            gap = Grid.get_grid_detector_gap(x,detectordistance,pitch)
+        if shiftx is not None and shifty is not None:
+            shift = numpy.array([shifty,shiftx])
+            x = numpy.append(x,[shift],axis=0)
+        if len(x) == 2:
+            peaks = numpy.append([x],[beamcenter],axis=0)
+        else:
+            peaks = numpy.append(x,[beamcenter],axis=0)
+        z = numpy.ones((len(peaks),2))
+        z[:,0] = -(detectordistance/172e-6)
+        peaks = numpy.append(peaks,z,axis=1)
+        d = (detectordistance-gap)/172e-6
+        Projektion = numpy.identity(4)
+        Projektion[3,2] = -1/d
+        Projektion[3,3] = 0
+        c = numpy.dot(Projektion,peaks.T[:]).T
+        c = c[:]/c[0,3]
+        if shiftx is not None and shifty is not None:
+            shifty,shiftx = c[-2,0:2]
+            good_peaks = c[:-2,0:2]
+            bc = c[-1,0:2]
+            return good_peaks,shiftx,shifty, bc;
+        elif len(x) == 2:
+            good_peaks = c[0,0:2]
+            bc = c[-1,0:2]
+            return good_peaks, bc;
+        else:
+            good_peaks = c[:-2,0:2]
+            bc = c[-1,0:2]
+            return good_peaks, bc;
+    
+        
+        
+        
+        
+    def visualize_grid(self):
+        """
+        Plots the the the calculated Values as far as calculated.
+        """
+        plt.imshow(self.image, aspect='auto')
+        plt.show()
+        if self.coordinates != []:
+            plt.plot(self.coordinates[:,1],self.coordinates[:,0],"ow")
             
-            
-    def build_rough_grid(self,module):
-        """
-        Build the grid for in Order to the given Module Size and Center
-        of the Grid. Important these are not identical with the center 
-        the Modules!
-        @Parameter module: Simple Intenger number
-        """
-        if self.grid is None:
-            self.spacing_grid()
-        X = int(MODULE_SIZE[1]/int(2*self.mean_vec_x[1]))+1
-        Y = int(MODULE_SIZE[0]/int(2*self.mean_vec_y[0]))+!
-        Grid = numpy.zeros(2*(4*X*Y)).reshape(4*X*Y,2)
-        for i in range(-Y,Y): 
-            for j in range(-X,X): 
-                Grid[(Y+i)*2*X+X+j] = i*self.mean_vec_y+j*self.mean_vec_x+self.center_of_grid[module]
-        self.grid['Module_%d' %module] = Grid 
+        if self.good_peaks != []:
+            plt.plot(self.good_peaks[:,1],self.good_peaks[:,0],"or")
+        
+        if self.grid != []:
+            plt.plot(self.grid[:,1],self.grid[:,0],"og")
 
-
-    def find_missing_points(self):
-        """
-        """
-        for i in range(self.Singlemodule.amount):
-            if self.grid['Module_%d' %i] != 0:
-                ensemble = np.append(self.coordinates,self.grid['Module_%d' %module],axis=0)
-                nbrs = NearestNeighbors(n_neighbors = 2, algorithm='ball_tree').fit(ensemble)
-                distances, indices = nbrs.kneighbors(ensemble)
-                perfect_peak=np.zeros(2*len(self.coordinates)).reshape(len(self.coordinates),2)
-                Ende=np.zeros(2*len(self.coordinates)).reshape(len(self.coordinates),2)
-                for i in range(len(self.coordinates)):
-                    if indices[i,1]>len(self.coordinates):
-                        perfect_peak[i,:]=Besser[i,:]
-                        Ende[i,:]=Besser[indices[i,1],:]
-                        Ende=Ende[Ende.all(1)]
-                        perfect_peaks = perfect_peak[perfect_peak.all(1)]
-
-    
-    
-    
     
     def alginement(self):
         """
@@ -233,3 +439,15 @@ class Grid(object):
         self.nearest_neighbors()
         self.mean_of_vectors()
         raise NotImplemented("TODO")
+
+correction1 = numpy.zeros((9,3))
+g = Grid(pyFAI.detectors.Pilatus2M(),'grid1_wax_0004p.cbf',2.54,numpy.array([1030,734]),0.647)
+g.apply_threshold(level=10)
+correction1 = numpy.zeros((9,3))
+#correction1[0,0:2], correction[0,2] = g.minimize()
+
+modules = [7,10,13,16,12,14,15,17]
+for i in range(8):
+    g = Grid(pyFAI.detectors.Pilatus2M(),'grid1_wax_0004p.cbf',2.54,numpy.array([1030,734]),0.647)
+    g.apply_threshold(level=10, module = modules[i])
+    correction1[i+1,0:2], correction[i+1,2], = g.minimize()
